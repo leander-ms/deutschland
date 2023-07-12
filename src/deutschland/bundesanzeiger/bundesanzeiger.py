@@ -1,25 +1,26 @@
-import hashlib
-import json
 from io import BytesIO
-
+import re
 import dateparser
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+import hashlib
+import json
 
 from deutschland.config import Config, module_config
 
+class MissingTableException(Exception):
+    pass
 
 class Report:
-    __slots__ = ["date", "name", "content_url", "company", "report", "raw_report"]
+    __slots__ = ["date", "name", "content_url", "company", "report"]
 
-    def __init__(self, date, name, content_url, company, report=None, raw_report=None):
+    def __init__(self, date, name, content_url, company, report=None):
         self.date = date
         self.name = name
         self.content_url = content_url
         self.company = company
         self.report = report
-        self.raw_report = raw_report
 
     def to_dict(self):
         return {
@@ -27,7 +28,6 @@ class Report:
             "name": self.name,
             "company": self.company,
             "report": self.report,
-            "raw_report": self.raw_report,
         }
 
     def to_hash(self):
@@ -114,10 +114,14 @@ class Bundesanzeiger:
 
             yield Report(date, entry_name, entry_link, company_name)
 
-    def __generate_result(self, content: str):
+    def __generate_result(self, content: str, report_name: str):
         """iterate trough all results and try to fetch single reports"""
         result = {}
+        
         for element in self.__find_all_entries_on_page(content):
+            if element.name != report_name and report_name != 'all':
+                continue
+
             get_element_response = self.session.get(element.content_url)
 
             if self.__is_captcha_needed(get_element_response.text):
@@ -142,13 +146,13 @@ class Bundesanzeiger:
                 continue
 
             element.report = content_element.text
-            element.raw_report = content_element.prettify()
 
-            result[element.to_hash()] = element.to_dict()
+            result[element.name] = element.to_dict()
 
         return result
 
-    def get_reports(self, company_name: str):
+
+    def get_reports(self, company_name: str, report_name: str = 'all'):
         """
         fetch all reports for this company name
         :param company_name:
@@ -183,10 +187,95 @@ class Bundesanzeiger:
         response = self.session.get(
             f"https://www.bundesanzeiger.de/pub/de/start?0-2.-top%7Econtent%7Epanel-left%7Ecard-form=&fulltext={company_name}&area_select=&search_button=Suchen"
         )
-        return self.__generate_result(response.text)
+        return self.__generate_result(content=response.text, report_name=report_name)
+    
+
+    def __generate_result_bilanz(self, content: str, report_name: str):
+        """iterate trough all results and try to fetch single reports"""        
+        for element in self.__find_all_entries_on_page(content):
+            if element.name != report_name:
+                continue
+
+            get_element_response = self.session.get(element.content_url)
+
+            if self.__is_captcha_needed(get_element_response.text):
+                soup = BeautifulSoup(get_element_response.text, "html.parser")
+                captcha_image_src = soup.find("div", {"class": "captcha_wrapper"}).find(
+                    "img"
+                )["src"]
+                img_response = self.session.get(captcha_image_src)
+                captcha_result = self.captcha_callback(img_response.content)
+                captcha_endpoint_url = soup.find_all("form")[1]["action"]
+                get_element_response = self.session.post(
+                    captcha_endpoint_url,
+                    data={"solution": captcha_result, "confirm-button": "OK"},
+                )
+            
+            soup = BeautifulSoup(get_element_response.text, 'html.parser')
+
+            h3 = soup.find('h3', {'id': re.compile('^(jp_Bilanz|jp_Handelsbilanz|jp_Konzernbilanz|jp_Konzern_Bilanz).*', re.IGNORECASE)})
+            tables = []
+            sibling = h3.find_next_sibling()
+
+            while sibling and sibling.name != 'h3':
+                if sibling.name == 'table':
+                    tables.append(sibling)
+
+                sibling = sibling.find_next_sibling()
+
+            data = []
+
+            for i, table in enumerate(tables, start=1):
+                rows = table.find_all('tr')
+                for row in rows:
+                    cols = row.find_all('td')
+                    cols = [ele.text.strip() for ele in cols]
+                    if any(ele for ele in cols if ele):  # Check if there is any non-None value
+                        data.append([ele for ele in cols if ele])
+
+        return data 
+            
+
+
+    def get_reports_bilanz(self, company_name: str, report_name: str):
+        """
+        fetch all reports for this company name
+        :param company_name:
+        :return" : "Dict of all reports
+        """
+        self.session.cookies["cc"] = "1628606977-805e172265bfdbde-10"
+        self.session.headers.update(
+            {
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7,et;q=0.6,pl;q=0.5",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "DNT": "1",
+                "Host": "www.bundesanzeiger.de",
+                "Pragma": "no-cache",
+                "Referer": "https://www.bundesanzeiger.de/",
+                "sec-ch-ua-mobile": "?0",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36",
+            }
+        )
+        # get the jsessionid cookie
+        response = self.session.get("https://www.bundesanzeiger.de")
+        # go to the start page
+        response = self.session.get("https://www.bundesanzeiger.de/pub/de/start?0")
+        # perform the search
+        response = self.session.get(
+            f"https://www.bundesanzeiger.de/pub/de/start?0-2.-top%7Econtent%7Epanel-left%7Ecard-form=&fulltext={company_name}&area_select=&search_button=Suchen"
+        )
+        return self.__generate_result_bilanz(content=response.text, report_name=report_name)
 
 
 if __name__ == "__main__":
     ba = Bundesanzeiger()
-    reports = ba.get_reports("Deutsche Bahn AG")
-    print(reports.keys(), len(reports))
+    report = ba.get_reports_bilanz(company_name="Deutsche Bahn AG", report_name='Konzernabschluss zum Geschäftsjahr vom 01.01.2021 bis zum 31.12.2021')
+    print(report)
